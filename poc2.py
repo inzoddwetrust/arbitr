@@ -42,6 +42,7 @@ from playwright.async_api import async_playwright, Page, Browser, Locator
 # Optional dependencies
 try:
     from playwright_stealth import stealth_async
+
     HAS_STEALTH = True
 except ImportError:
     HAS_STEALTH = False
@@ -49,11 +50,11 @@ except ImportError:
 
 try:
     import pymupdf
+
     HAS_PYMUPDF = True
 except ImportError:
     HAS_PYMUPDF = False
     print("pymupdf not installed. Run: pip install pymupdf")
-
 
 # === Logging Configuration ===
 logging.basicConfig(
@@ -62,7 +63,6 @@ logging.basicConfig(
     datefmt="%H:%M:%S"
 )
 log = logging.getLogger(__name__)
-
 
 # === Configuration ===
 BASE_URL = "https://kad.arbitr.ru/"
@@ -104,6 +104,10 @@ class DocumentMeta:
     signature_valid: bool = False
     source_tab: str = ""  # "court_acts", "cards", "electronic_case"
     instance_id: Optional[str] = None  # For cards tab
+    instance_name: Optional[str] = None  # Human-readable instance name
+    position: int = 0  # Position within instance (1 = newest)
+    page: int = 1  # Pagination page number
+    position_on_page: int = 0  # Position on the page (1-based)
 
 
 @dataclass
@@ -120,8 +124,9 @@ class Instance:
     """Court instance (accordion in Cards tab)."""
     instance_id: str
     name: str
+    order: int = 0  # Order in the case (1, 2, 3... from top to bottom)
     court: Optional[str] = None
-    documents: list[str] = field(default_factory=list)  # List of doc_ids
+    documents: list[str] = field(default_factory=list)  # List of doc_ids in chronological order
     page_count: int = 1
 
 
@@ -135,6 +140,8 @@ class CaseInfo:
     parsed_at: str = ""
     total_documents: int = 0
     instances_count: int = 0
+    # Fingerprints for quick change detection
+    fingerprints: dict = field(default_factory=dict)  # {instance_id: first_doc_id, "ed": first_doc_id}
 
 
 @dataclass
@@ -196,7 +203,8 @@ def save_progress(output_dir: Path, progress: Progress) -> None:
         json.dumps(asdict(progress), ensure_ascii=False, indent=2),
         encoding="utf-8"
     )
-    log.info(f"💾 Progress saved: {len(progress.downloaded)} done, {len(progress.failed)} failed, {len(progress.pending)} pending")
+    log.info(
+        f"💾 Progress saved: {len(progress.downloaded)} done, {len(progress.failed)} failed, {len(progress.pending)} pending")
 
 
 def load_progress(output_dir: Path) -> Optional[Progress]:
@@ -274,8 +282,24 @@ def normalize_court_name(raw: str) -> str:
     return " ".join(result)
 
 
+def make_safe_folder_name(name: str, max_length: int = 30) -> str:
+    """
+    Create filesystem-safe folder name from instance name.
+    Replaces spaces with underscores, removes special chars.
+    """
+    # Replace spaces and problematic chars
+    safe = name.replace(" ", "_").replace("/", "-").replace("\\", "-")
+    # Remove other special chars
+    safe = re.sub(r'[<>:"|?*]', '', safe)
+    # Truncate if too long
+    if len(safe) > max_length:
+        safe = safe[:max_length]
+    return safe
+
+
 # === HTML Parsing ===
-async def parse_document_metadata(link_element: Locator, source_tab: str, instance_id: Optional[str] = None) -> Optional[DocumentMeta]:
+async def parse_document_metadata(link_element: Locator, source_tab: str, instance_id: Optional[str] = None) -> \
+Optional[DocumentMeta]:
     """
     Parse rich metadata from document link element and its context.
     """
@@ -561,6 +585,7 @@ async def click_cards_tab(page: Page) -> bool:
 async def collect_cards_all_instances(page: Page) -> tuple[list[DocumentMeta], list[Instance]]:
     """
     Collect all documents from Cards tab with accordion structure.
+    Tracks position of each document for proper ordering.
     Returns (documents, instances).
     """
     documents = []
@@ -590,15 +615,24 @@ async def collect_cards_all_instances(page: Page) -> tuple[list[DocumentMeta], l
         instance = Instance(
             instance_id=instance_id,
             name=instance_name,
+            order=inst_idx + 1,  # 1-based order
         )
+
+        # Position counter for this instance
+        global_position = 0
 
         # Header PDFs (main decision)
         header_links = header.locator("a[href*='PdfDocument']")
         header_count = await header_links.count()
         for i in range(header_count):
+            global_position += 1
             link = header_links.nth(i)
             doc = await parse_document_metadata(link, "cards", instance_id)
             if doc:
+                doc.instance_name = instance_name
+                doc.position = global_position
+                doc.page = 0  # Header is "page 0"
+                doc.position_on_page = i + 1
                 documents.append(doc)
                 instance.documents.append(doc.doc_id)
 
@@ -667,6 +701,11 @@ async def collect_cards_all_instances(page: Page) -> tuple[list[DocumentMeta], l
                 doc = await parse_document_metadata(link, "cards", instance_id)
                 if doc:
                     if doc.doc_id not in instance.documents:
+                        global_position += 1
+                        doc.instance_name = instance_name
+                        doc.position = global_position
+                        doc.page = page_num
+                        doc.position_on_page = i + 1
                         documents.append(doc)
                         instance.documents.append(doc.doc_id)
                 else:
@@ -674,6 +713,11 @@ async def collect_cards_all_instances(page: Page) -> tuple[list[DocumentMeta], l
                     if url:
                         doc = await parse_document_simple(url, "cards", instance_id)
                         if doc.doc_id not in instance.documents:
+                            global_position += 1
+                            doc.instance_name = instance_name
+                            doc.position = global_position
+                            doc.page = page_num
+                            doc.position_on_page = i + 1
                             documents.append(doc)
                             instance.documents.append(doc.doc_id)
 
@@ -762,12 +806,12 @@ async def collect_electronic_case(page: Page) -> list[DocumentMeta]:
 
 # === PDF Download ===
 async def download_single_pdf(
-    page: Page,
-    doc: DocumentMeta,
-    output_dir: Path,
-    idx: int,
-    total: int,
-    max_retries: int = 3
+        page: Page,
+        doc: DocumentMeta,
+        output_dir: Path,
+        idx: int,
+        total: int,
+        max_retries: int = 3
 ) -> Optional[bytes]:
     """
     Download single PDF with retry logic.
@@ -866,8 +910,30 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> tuple[str, bool]:
 
 
 # === Output Generation ===
-def save_document(doc: DocumentFull, output_dir: Path) -> None:
-    """Save single document to documents/ folder."""
+def save_document(doc: DocumentFull, output_dir: Path, instances: list[Instance] = None) -> None:
+    """
+    Save single document to appropriate folder.
+    - Cards documents go to instances/<folder>/<position>_<doc_id>.json
+    - Other documents go to documents/<doc_id>.json
+    """
+    if doc.source_tab == "cards" and doc.instance_id and instances:
+        # Find instance folder
+        inst = next((i for i in instances if i.instance_id == doc.instance_id), None)
+        if inst:
+            safe_name = make_safe_folder_name(inst.name)
+            folder_name = f"{inst.order:02d}_{safe_name}_{inst.instance_id[:8]}"
+            inst_dir = output_dir / "instances" / folder_name
+            inst_dir.mkdir(parents=True, exist_ok=True)
+
+            # Filename: position_docid.json (e.g., 001_c72fa488.json)
+            doc_file = inst_dir / f"{doc.position:03d}_{doc.doc_id[:8]}.json"
+            doc_file.write_text(
+                json.dumps(asdict(doc), ensure_ascii=False, indent=2),
+                encoding="utf-8"
+            )
+            return
+
+    # Default: save to documents/
     docs_dir = output_dir / "documents"
     docs_dir.mkdir(parents=True, exist_ok=True)
 
@@ -879,14 +945,40 @@ def save_document(doc: DocumentFull, output_dir: Path) -> None:
 
 
 def save_case_structure(
-    output_dir: Path,
-    case_info: CaseInfo,
-    court_acts_docs: list[DocumentMeta],
-    cards_docs: list[DocumentMeta],
-    instances: list[Instance],
-    ed_docs: list[DocumentMeta],
+        output_dir: Path,
+        case_info: CaseInfo,
+        court_acts_docs: list[DocumentMeta],
+        cards_docs: list[DocumentMeta],
+        instances: list[Instance],
+        ed_docs: list[DocumentMeta],
 ) -> None:
-    """Save case.json, court_acts.json, instances/, electronic_case.json."""
+    """
+    Save case structure with folder-based instances.
+
+    Structure:
+        case_XXX/
+        ├── case.json
+        ├── court_acts.json
+        ├── electronic_case.json
+        └── instances/
+            ├── 01_Апелляционная_5a7f7ecc/
+            │   ├── instance.json
+            │   └── (documents saved separately during download)
+            └── 02_Первая_44af3e0d/
+                └── ...
+    """
+
+    # Build fingerprints from first doc of each instance
+    fingerprints = {}
+    for inst in instances:
+        if inst.documents:
+            fingerprints[inst.instance_id] = inst.documents[0]
+    if ed_docs:
+        fingerprints["electronic_case"] = ed_docs[0].doc_id
+    if court_acts_docs:
+        fingerprints["court_acts"] = court_acts_docs[0].doc_id
+
+    case_info.fingerprints = fingerprints
 
     # case.json
     case_file = output_dir / "case.json"
@@ -907,8 +999,9 @@ def save_case_structure(
                 "title": d.title,
                 "court": d.court,
                 "judge": d.judge,
+                "position": i + 1,
             }
-            for d in court_acts_docs
+            for i, d in enumerate(court_acts_docs)
         ]
     }
     (output_dir / "court_acts.json").write_text(
@@ -916,14 +1009,30 @@ def save_case_structure(
         encoding="utf-8"
     )
 
-    # instances/
+    # instances/ - folder for each instance
     instances_dir = output_dir / "instances"
     instances_dir.mkdir(parents=True, exist_ok=True)
 
     for inst in instances:
-        inst_file = instances_dir / f"inst_{inst.instance_id}.json"
-        inst_file.write_text(
-            json.dumps(asdict(inst), ensure_ascii=False, indent=2),
+        # Create folder name: 01_Апелляционная_5a7f7ecc
+        safe_name = make_safe_folder_name(inst.name)
+        folder_name = f"{inst.order:02d}_{safe_name}_{inst.instance_id[:8]}"
+        inst_folder = instances_dir / folder_name
+        inst_folder.mkdir(parents=True, exist_ok=True)
+
+        # Save instance.json
+        inst_data = {
+            "instance_id": inst.instance_id,
+            "name": inst.name,
+            "order": inst.order,
+            "court": inst.court,
+            "page_count": inst.page_count,
+            "document_count": len(inst.documents),
+            "documents": inst.documents,  # List of doc_ids in order
+            "folder": folder_name,
+        }
+        (inst_folder / "instance.json").write_text(
+            json.dumps(inst_data, ensure_ascii=False, indent=2),
             encoding="utf-8"
         )
 
@@ -937,8 +1046,9 @@ def save_case_structure(
                 "date": d.date,
                 "doc_type": d.doc_type,
                 "title": d.title,
+                "position": i + 1,
             }
-            for d in ed_docs
+            for i, d in enumerate(ed_docs)
         ]
     }
     (output_dir / "electronic_case.json").write_text(
@@ -948,12 +1058,12 @@ def save_case_structure(
 
 
 def generate_readme(
-    output_dir: Path,
-    case_info: CaseInfo,
-    instances: list[Instance],
-    total_docs: int,
-    downloaded_count: int,
-    failed_count: int,
+        output_dir: Path,
+        case_info: CaseInfo,
+        instances: list[Instance],
+        total_docs: int,
+        downloaded_count: int,
+        failed_count: int,
 ) -> None:
     """Generate README.md for the case."""
 
@@ -1009,6 +1119,177 @@ def generate_readme(
     readme_file.write_text(readme_content, encoding="utf-8")
 
 
+# === Fingerprint and Cache Functions ===
+def load_cached_case_info(output_dir: Path) -> Optional[CaseInfo]:
+    """Load cached case info from case.json."""
+    case_file = output_dir / "case.json"
+    if not case_file.exists():
+        return None
+    try:
+        data = json.loads(case_file.read_text(encoding="utf-8"))
+        return CaseInfo(**data)
+    except Exception as e:
+        log.warning(f"Failed to load cached case info: {e}")
+        return None
+
+
+def load_cached_instances(output_dir: Path) -> list[Instance]:
+    """Load cached instances from instances/ folder."""
+    instances = []
+    instances_dir = output_dir / "instances"
+    if not instances_dir.exists():
+        return instances
+
+    for folder in sorted(instances_dir.iterdir()):
+        if folder.is_dir():
+            inst_file = folder / "instance.json"
+            if inst_file.exists():
+                try:
+                    data = json.loads(inst_file.read_text(encoding="utf-8"))
+                    instances.append(Instance(
+                        instance_id=data.get("instance_id", ""),
+                        name=data.get("name", ""),
+                        order=data.get("order", 0),
+                        court=data.get("court"),
+                        documents=data.get("documents", []),
+                        page_count=data.get("page_count", 1),
+                    ))
+                except Exception as e:
+                    log.warning(f"Failed to load instance from {folder}: {e}")
+
+    return instances
+
+
+async def check_fingerprint_quick(page: Page, cached_fingerprints: dict) -> bool:
+    """
+    Quick check if case structure has changed.
+    Checks only first document of first Cards instance.
+    Returns True if fingerprint matches (no changes).
+    """
+    if not cached_fingerprints:
+        return False
+
+    # Get first instance's first doc_id from Cards tab
+    if not await click_cards_tab(page):
+        return False
+
+    # Find first accordion header
+    instance_headers = page.locator("#chrono_list_content .b-chrono-item-header.js-chrono-item-header")
+    if await instance_headers.count() == 0:
+        return False
+
+    first_header = instance_headers.first
+    instance_id = await first_header.get_attribute("data-id")
+
+    if not instance_id or instance_id not in cached_fingerprints:
+        return False
+
+    # Get first PDF link from header
+    first_link = first_header.locator("a[href*='PdfDocument']").first
+    if await first_link.count() == 0:
+        # Try expanding accordion
+        collapse_btn = first_header.locator(".b-collapse.js-collapse")
+        if await collapse_btn.count() > 0:
+            await collapse_btn.click()
+            await page.wait_for_timeout(1000)
+
+        # Get first link from container
+        container = page.locator(".b-chrono-items-container.js-chrono-items-container").first
+        first_link = container.locator("a[href*='PdfDocument']").first
+
+    if await first_link.count() == 0:
+        return False
+
+    url = await first_link.get_attribute("href")
+    if not url:
+        return False
+
+    # Extract doc_id from URL
+    _, current_first_doc_id = extract_guid_from_url(url)
+    cached_first_doc_id = cached_fingerprints.get(instance_id)
+
+    if current_first_doc_id == cached_first_doc_id:
+        log.info(f"✅ Fingerprint match! First doc unchanged: {current_first_doc_id[:8]}...")
+        return True
+    else:
+        log.info(
+            f"⚠️ Fingerprint mismatch! First doc changed: {cached_first_doc_id[:8] if cached_first_doc_id else 'None'}... → {current_first_doc_id[:8]}...")
+        return False
+
+
+def load_cached_documents_metadata(output_dir: Path, instances: list[Instance]) -> list[DocumentMeta]:
+    """
+    Load document metadata from cached structure (without full text).
+    Used for resume when fingerprint matches.
+    """
+    documents = []
+
+    # Load from instance folders
+    instances_dir = output_dir / "instances"
+    if instances_dir.exists():
+        for folder in sorted(instances_dir.iterdir()):
+            if folder.is_dir():
+                for doc_file in sorted(folder.glob("*.json")):
+                    if doc_file.name == "instance.json":
+                        continue
+                    try:
+                        data = json.loads(doc_file.read_text(encoding="utf-8"))
+                        # Create DocumentMeta from saved data
+                        doc = DocumentMeta(
+                            doc_id=data.get("doc_id", ""),
+                            case_guid=data.get("case_guid", ""),
+                            url=data.get("url", ""),
+                            filename=data.get("filename", ""),
+                            date=data.get("date"),
+                            doc_type=data.get("doc_type"),
+                            title=data.get("title"),
+                            court=data.get("court"),
+                            judge=data.get("judge"),
+                            signed=data.get("signed", False),
+                            signature_valid=data.get("signature_valid", False),
+                            source_tab=data.get("source_tab", ""),
+                            instance_id=data.get("instance_id"),
+                            instance_name=data.get("instance_name"),
+                            position=data.get("position", 0),
+                            page=data.get("page", 1),
+                            position_on_page=data.get("position_on_page", 0),
+                        )
+                        documents.append(doc)
+                    except Exception as e:
+                        log.debug(f"Failed to load doc from {doc_file}: {e}")
+
+    # Load from documents/ folder
+    docs_dir = output_dir / "documents"
+    if docs_dir.exists():
+        for doc_file in docs_dir.glob("*.json"):
+            try:
+                data = json.loads(doc_file.read_text(encoding="utf-8"))
+                doc = DocumentMeta(
+                    doc_id=data.get("doc_id", ""),
+                    case_guid=data.get("case_guid", ""),
+                    url=data.get("url", ""),
+                    filename=data.get("filename", ""),
+                    date=data.get("date"),
+                    doc_type=data.get("doc_type"),
+                    title=data.get("title"),
+                    court=data.get("court"),
+                    judge=data.get("judge"),
+                    signed=data.get("signed", False),
+                    signature_valid=data.get("signature_valid", False),
+                    source_tab=data.get("source_tab", ""),
+                    instance_id=data.get("instance_id"),
+                    instance_name=data.get("instance_name"),
+                    position=data.get("position", 0),
+                    page=data.get("page", 1),
+                    position_on_page=data.get("position_on_page", 0),
+                )
+                documents.append(doc)
+            except Exception as e:
+                log.debug(f"Failed to load doc from {doc_file}: {e}")
+
+    return documents
+
+
 # === Main Processing ===
 async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
     """
@@ -1051,45 +1332,76 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
 
     log.info(f"\n📁 Output directory: {output_dir}")
 
-    # Check for existing progress
+    # Check for existing progress and cached structure
     progress = load_progress(output_dir)
-    if progress and progress.pending:
+    cached_case_info = load_cached_case_info(output_dir)
+    use_cache = False
+    instances = []
+    all_docs = []
+    court_acts_docs = []
+    cards_docs = []
+    ed_docs = []
+
+    if progress and progress.downloaded and cached_case_info and cached_case_info.fingerprints:
         log.info(f"📂 Found previous progress: {len(progress.downloaded)} done, {len(progress.pending)} pending")
-    else:
+        log.info("🔍 Checking fingerprint...")
+
+        # Quick fingerprint check
+        fingerprint_match = await check_fingerprint_quick(page, cached_case_info.fingerprints)
+
+        if fingerprint_match:
+            log.info("📋 Using cached structure (no changes detected)")
+            use_cache = True
+
+            # Load cached structure
+            instances = load_cached_instances(output_dir)
+            all_docs = load_cached_documents_metadata(output_dir, instances)
+
+            # Use cached case_info but update parsed_at
+            case_info = cached_case_info
+            case_info.url = case_url  # Make sure URL is set for refresh
+
+            log.info(f"   Loaded {len(instances)} instances, {len(all_docs)} document metadata")
+        else:
+            log.info("📋 Structure changed, re-parsing...")
+
+    if not progress:
         progress = Progress()
 
-    # === Collect documents from all tabs ===
-    log.info(f"\n--- Collecting documents ---")
+    if not use_cache:
+        # === Full parsing of all tabs ===
+        log.info(f"\n--- Collecting documents ---")
 
-    # Court Acts
-    court_acts_docs = await collect_court_acts(page)
+        # Court Acts
+        court_acts_docs = await collect_court_acts(page)
 
-    # Cards (with instances)
-    cards_docs, instances = await collect_cards_all_instances(page)
+        # Cards (with instances)
+        cards_docs, instances = await collect_cards_all_instances(page)
 
-    # Electronic Case
-    ed_docs = await collect_electronic_case(page)
+        # Electronic Case
+        ed_docs = await collect_electronic_case(page)
 
-    # Deduplicate by doc_id
-    all_docs_map: dict[str, DocumentMeta] = {}
-    for doc in court_acts_docs + cards_docs + ed_docs:
-        if doc.doc_id not in all_docs_map:
-            all_docs_map[doc.doc_id] = doc
+        # Deduplicate by doc_id
+        all_docs_map: dict[str, DocumentMeta] = {}
+        for doc in court_acts_docs + cards_docs + ed_docs:
+            if doc.doc_id not in all_docs_map:
+                all_docs_map[doc.doc_id] = doc
 
-    all_docs = list(all_docs_map.values())
+        all_docs = list(all_docs_map.values())
+
+        log.info(f"\n📊 TOTAL UNIQUE DOCUMENTS: {len(all_docs)}")
+        log.info(f"   - Court Acts: {len(court_acts_docs)}")
+        log.info(f"   - Cards: {len(cards_docs)} ({len(instances)} instances)")
+        log.info(f"   - Electronic Case: {len(ed_docs)}")
+
+        # Update case info
+        case_info.total_documents = len(all_docs)
+        case_info.instances_count = len(instances)
+
+        # Save structure (without texts yet)
+        save_case_structure(output_dir, case_info, court_acts_docs, cards_docs, instances, ed_docs)
+
     total_docs = len(all_docs)
-
-    log.info(f"\n📊 TOTAL UNIQUE DOCUMENTS: {total_docs}")
-    log.info(f"   - Court Acts: {len(court_acts_docs)}")
-    log.info(f"   - Cards: {len(cards_docs)} ({len(instances)} instances)")
-    log.info(f"   - Electronic Case: {len(ed_docs)}")
-
-    # Update case info
-    case_info.total_documents = total_docs
-    case_info.instances_count = len(instances)
-
-    # Save structure (without texts yet)
-    save_case_structure(output_dir, case_info, court_acts_docs, cards_docs, instances, ed_docs)
 
     # === Download and process documents ===
     log.info(f"\n--- Downloading {total_docs} documents ---")
@@ -1099,6 +1411,10 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
         already_done = set(progress.downloaded)
         docs_to_download = [d for d in all_docs if d.doc_id not in already_done]
         log.info(f"⏭️  Skipping {len(already_done)} already downloaded")
+        # Clear failed - we'll retry them
+        if progress.failed:
+            log.info(f"🔄 Will retry {len(progress.failed)} previously failed")
+            progress.failed = []
     else:
         docs_to_download = all_docs
 
@@ -1114,11 +1430,15 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
         # Check for break
         if should_take_break(idx):
             await take_break()
-            # Keep session alive after break - refresh case card
-            log.info("🔄 Refreshing session...")
+            # Keep session alive - double refresh with proper delays
+            log.info("🔄 Refreshing session (1/2)...")
             try:
                 await page.goto(case_info.url, wait_until="domcontentloaded", timeout=30000)
-                await page.wait_for_timeout(2000)
+                await page.wait_for_timeout(5000)
+
+                log.info("🔄 Refreshing session (2/2)...")
+                await page.goto(case_info.url, wait_until="domcontentloaded", timeout=30000)
+                await page.wait_for_timeout(5000)
             except Exception as e:
                 log.warning(f"Session refresh failed: {e}")
 
@@ -1139,6 +1459,8 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
 
             # Regular failure
             progress.failed.append(doc.doc_id)
+            if doc.doc_id in progress.pending:
+                progress.pending.remove(doc.doc_id)
             failed_count += 1
         else:
             # Extract text
@@ -1154,7 +1476,7 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
             )
 
             # Save document
-            save_document(full_doc, output_dir)
+            save_document(full_doc, output_dir, instances)
 
             progress.downloaded.append(doc.doc_id)
             progress.pending.remove(doc.doc_id)
