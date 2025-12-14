@@ -1,9 +1,13 @@
 #!/usr/bin/env python3
 """
 PoC Crawler for kad.arbitr.ru
-Phase 0: Proof of Concept
+Phase 0.5: Extended Proof of Concept
 
-Step 1: Search by case number
+Features:
+- Search by case number
+- Parse case card (instances, court acts)
+- Parse "Электронное дело" tab with pagination
+- Download all PDFs via response interceptor
 """
 
 import asyncio
@@ -42,7 +46,7 @@ async def close_promo_popup(page: Page) -> None:
         if await popup_close.count() > 0 and await popup_close.is_visible():
             await popup_close.click()
             log.info("Closed promo popup")
-            await page.wait_for_timeout(500)  # Wait for animation
+            await page.wait_for_timeout(500)
     except Exception as e:
         log.debug(f"No promo popup or error closing: {e}")
 
@@ -50,7 +54,6 @@ async def close_promo_popup(page: Page) -> None:
 async def search_by_case_number(page: Page, case_number: str) -> bool:
     """
     Search for a case by its number.
-
     Returns True if search was successful, False otherwise.
     """
     log.info(f"Searching for case: {case_number}")
@@ -61,10 +64,6 @@ async def search_by_case_number(page: Page, case_number: str) -> bool:
 
     # Wait for JS to fully initialize
     await page.wait_for_timeout(3000)
-
-    # Screenshot before search
-    await page.screenshot(path="debug_before_search.png")
-    log.info("Saved screenshot: debug_before_search.png")
 
     # Close promo popup if present
     await close_promo_popup(page)
@@ -90,151 +89,78 @@ async def search_by_case_number(page: Page, case_number: str) -> bool:
         input.dispatchEvent(new Event('input', { bubbles: true }));
         input.dispatchEvent(new Event('change', { bubbles: true }));
     """)
-    log.info("Triggered input events")
 
-    # Wait for and intercept the Suggest API response
-    suggest_data = None
-    try:
-        async with page.expect_response(
-                lambda resp: "Suggest/CaseNum" in resp.url,
-                timeout=5000
-        ) as response_info:
-            await page.wait_for_timeout(100)  # Allow request to be made
-
-        response = await response_info.value
-        if response.status == 200:
-            suggest_data = await response.json()
-            log.info(f"Suggest API response: {suggest_data}")
-    except Exception as e:
-        log.warning(f"Could not intercept Suggest response: {e}")
-
-    # Wait for suggest dropdown to appear
+    # Wait for suggest dropdown
     await page.wait_for_timeout(1000)
 
-    # Screenshot suggest
-    await page.screenshot(path="debug_suggest_visible.png")
-    log.info("Saved screenshot: debug_suggest_visible.png")
-
-    # Extract GUID from suggest dropdown or API response
+    # Extract GUID from suggest dropdown
     case_guid = None
-
-    # Try to get GUID from the suggest item's id attribute
     suggest_item = page.locator("#b-suggest li a, .b-suggest li a").first
     if await suggest_item.count() > 0:
-        suggest_text = await suggest_item.text_content()
         case_guid = await suggest_item.get_attribute("id")
-        log.info(f"Found suggest item: '{suggest_text}' with GUID: {case_guid}")
+        log.info(f"Found suggest item with GUID: {case_guid}")
 
-        # Check if GUID is valid (not all zeros)
+        # Navigate directly to case card if GUID is valid
         if case_guid and case_guid != "00000000-0000-0000-0000-000000000000":
-            # Navigate directly to the case card!
             card_url = f"https://kad.arbitr.ru/Card/{case_guid}"
             log.info(f"Navigating directly to case card: {card_url}")
             await page.goto(card_url, wait_until="domcontentloaded")
             return True
-        else:
-            log.info("GUID is empty or invalid, trying keyboard navigation...")
 
     # Fallback: Try keyboard navigation
     await page.keyboard.press("ArrowDown")
-    log.info("Pressed ArrowDown to select suggest item")
     await page.wait_for_timeout(200)
-
     await page.keyboard.press("Enter")
-    log.info("Pressed Enter to confirm selection")
 
-    # Wait for search AJAX request to be made
-    log.info("Waiting for search request...")
+    # Wait for navigation
     try:
-        search_response = await page.wait_for_response(
+        await page.wait_for_response(
             lambda r: "Kad/Search" in r.url or "/Card/" in r.url,
             timeout=15000
         )
-        log.info(f"Search/navigation detected: {search_response.url[:100]}")
     except:
         log.warning("No search request detected within timeout")
 
-    # Wait a bit more for results
-    await page.wait_for_timeout(1000)
-
-    # Check if loading indicator appeared
-    loading = page.locator(".b-case-loading:not([style*='none']), .loading")
-    if await loading.count() > 0:
-        log.info("Loading indicator detected, waiting...")
-
     await page.wait_for_timeout(2000)
-    await page.screenshot(path="debug_after_click.png")
-    log.info("Saved screenshot: debug_after_click.png")
-
-    # Log current URL (maybe we navigated?)
-    current_url = page.url
-    log.info(f"Current URL: {current_url}")
 
     # Check for CAPTCHA
-    captcha = page.locator(".b-pravocaptcha-modal_wrapper:not(:empty), .g-recaptcha, iframe[src*='recaptcha']")
+    captcha = page.locator(".b-pravocaptcha-modal_wrapper:not(:empty), .g-recaptcha")
     if await captcha.count() > 0:
         log.warning("⚠️ CAPTCHA detected! Manual intervention needed.")
-        await page.screenshot(path="debug_captcha.png")
         return False
 
-    # Wait for results to load
-    # Could be either search results table OR case card page (if we navigated directly)
+    # Wait for results
     try:
         await page.wait_for_selector(
             "table#b-cases tbody tr, div.b-noResults:not(.g-hidden), input#caseId",
             timeout=30000
         )
-
-        # Check if we landed on case card directly
-        case_id_input = page.locator("input#caseId")
-        if await case_id_input.count() > 0:
-            log.info("Landed on case card page directly!")
-            return True
-
-        log.info("Search results loaded")
         return True
     except Exception as e:
         log.error(f"Timeout waiting for search results: {e}")
-        # Save screenshot for debugging
-        await page.screenshot(path="debug_search_timeout.png")
-        log.info("Saved debug screenshot: debug_search_timeout.png")
         return False
 
 
 async def navigate_to_case_card(page: Page, case_url: str) -> dict | None:
     """
     Navigate to a case card and extract case details.
-
     Returns dict with case info or None if failed.
     """
     log.info(f"Navigating to case card: {case_url}")
 
     await page.goto(case_url, wait_until="domcontentloaded", timeout=30000)
 
-    # Wait for case card to load - wait for chrono items (instances)
+    # Wait for case card to load
     try:
-        # Wait for the chronology section which contains instances
         await page.wait_for_selector(
-            "div.b-chrono-item-header.js-chrono-item-header",
+            "div.b-chrono-item-header.js-chrono-item-header, #chrono_list_content",
             timeout=15000
         )
-        log.info("Case card loaded - found chrono items")
-
-        # Give it a moment to fully render
+        log.info("Case card loaded")
         await page.wait_for_timeout(1000)
-
     except Exception as e:
         log.error(f"Failed to load case card: {e}")
-        await page.screenshot(path="debug_case_card_error.png")
-        html = await page.content()
-        with open("debug_case_card.html", "w", encoding="utf-8") as f:
-            f.write(html)
-        log.info("Saved HTML to debug_case_card.html")
         return None
-
-    # Take screenshot
-    await page.screenshot(path="debug_case_card.png")
-    log.info("Saved screenshot: debug_case_card.png")
 
     # Extract case info
     case_info = {}
@@ -256,107 +182,337 @@ async def navigate_to_case_card(page: Page, case_url: str) -> dict | None:
     if await status_elem.count() > 0:
         case_info["status"] = (await status_elem.text_content()).strip()
 
-    log.info(
-        f"Case: {case_info.get('case_number', 'N/A')} | GUID: {case_info.get('guid', 'N/A')} | Status: {case_info.get('status', 'N/A')}")
-
-    # Find all instances (судебные инстанции)
-    instances = []
-    instance_headers = page.locator("div.b-chrono-item-header.js-chrono-item-header")
-    instance_count = await instance_headers.count()
-    log.info(f"Found {instance_count} instance(s)")
-
-    for i in range(instance_count):
-        header = instance_headers.nth(i)
-
-        instance_info = {
-            "court_code": await header.get_attribute("data-court"),
-            "instance_id": await header.get_attribute("data-id"),
-        }
-
-        # Instance type (Первая инстанция / Апелляционная инстанция)
-        instance_type_elem = header.locator("div.l-col strong")
-        if await instance_type_elem.count() > 0:
-            instance_info["instance_type"] = (await instance_type_elem.text_content()).strip()
-
-        # Registration date
-        reg_date_elem = header.locator("span.b-reg-date")
-        if await reg_date_elem.count() > 0:
-            instance_info["reg_date"] = (await reg_date_elem.text_content()).strip()
-
-        # Instance case number
-        case_num_elem = header.locator("strong.b-case-instance-number")
-        if await case_num_elem.count() > 0:
-            instance_info["case_number"] = (await case_num_elem.text_content()).strip()
-
-        # Court name
-        court_name_elem = header.locator("span.instantion-name a")
-        if await court_name_elem.count() > 0:
-            instance_info["court_name"] = (await court_name_elem.text_content()).strip()
-
-        # Decision PDF link
-        pdf_link_elem = header.locator("h2.b-case-result a[href*='PdfDocument']")
-        if await pdf_link_elem.count() > 0:
-            instance_info["decision_pdf"] = await pdf_link_elem.get_attribute("href")
-            # Get decision text (clean it up)
-            decision_text = await pdf_link_elem.text_content()
-            instance_info["decision_text"] = " ".join(decision_text.split()).strip()
-
-        instances.append(instance_info)
-        log.info(f"  [{i + 1}] {instance_info.get('instance_type', 'N/A')}: {instance_info.get('court_name', 'N/A')}")
-        log.info(
-            f"      Case: {instance_info.get('case_number', 'N/A')} | Date: {instance_info.get('reg_date', 'N/A')}")
-        if instance_info.get('decision_pdf'):
-            log.info(f"      PDF: {instance_info.get('decision_text', 'N/A')[:60]}...")
-
-    case_info["instances"] = instances
+    log.info(f"Case: {case_info.get('case_number', 'N/A')} | GUID: {case_info.get('guid', 'N/A')}")
 
     return case_info
 
 
-async def download_case_pdfs(page: Page, case_details: dict, download_dir: str = "./downloads") -> list[str]:
+async def collect_court_acts_pdf_urls(page: Page) -> set[str]:
     """
-    Download all PDFs from case card.
-
-    Opens PDF in new tab, waits for WASM antibot, intercepts PDF response.
-
-    Args:
-        page: Playwright page (must be on case card page)
-        case_details: Dict from navigate_to_case_card with instances
-        download_dir: Base directory for downloads
-
-    Returns:
-        List of downloaded file paths
+    Collect PDF URLs from Court Acts section (#gr_case_acts).
+    This section has no pagination.
     """
-    case_number = case_details.get("case_number", "unknown")
+    pdf_urls = set()
 
-    # Sanitize case number for folder name (replace / with -)
-    safe_case_number = case_number.replace("/", "-")
+    court_acts_links = page.locator("#gr_case_acts a[href*='PdfDocument']")
+    count = await court_acts_links.count()
+    log.info(f"Found {count} PDF(s) in Court Acts section")
 
-    # Create folder for this case
-    case_dir = Path(download_dir) / safe_case_number
-    case_dir.mkdir(parents=True, exist_ok=True)
-    log.info(f"📁 Download folder: {case_dir}")
+    for i in range(count):
+        url = await court_acts_links.nth(i).get_attribute("href")
+        if url:
+            pdf_urls.add(url)
 
-    downloaded = []
-    instances = case_details.get("instances", [])
+    return pdf_urls
 
-    for inst in instances:
-        pdf_url = inst.get("decision_pdf")
-        if not pdf_url:
+
+async def click_cards_tab(page: Page) -> bool:
+    """
+    Click on "Карточки" tab to ensure it's active.
+    Returns True if successful.
+    """
+    log.info("Clicking on 'Карточки' tab...")
+
+    cards_tab = page.locator("div.js-case-chrono-button--cards")
+
+    if await cards_tab.count() == 0:
+        log.warning("'Карточки' tab not found")
+        return False
+
+    await cards_tab.click()
+
+    # Wait for content to become visible
+    try:
+        await page.wait_for_selector(
+            "#chrono_list_content:not(.g-hidden)",
+            timeout=10000
+        )
+        log.info("'Карточки' tab opened")
+        await page.wait_for_timeout(500)
+        return True
+    except Exception as e:
+        log.error(f"Failed to open 'Карточки' tab: {e}")
+        return False
+
+
+async def collect_cards_all_pages(page: Page) -> set[str]:
+    """
+    Collect all PDF URLs from all instances in "Карточки" tab.
+    Each instance is an accordion that needs to be expanded.
+    Each expanded instance may have its own pagination.
+    Returns deduplicated set of URLs.
+    """
+    all_urls = set()
+
+    # Click on Cards tab first
+    if not await click_cards_tab(page):
+        return all_urls
+
+    # Find all instance headers (accordions)
+    instance_headers = page.locator("#chrono_list_content .b-chrono-item-header.js-chrono-item-header")
+    instance_count = await instance_headers.count()
+    log.info(f"Found {instance_count} instance(s) in Cards tab")
+
+    for inst_idx in range(instance_count):
+        header = instance_headers.nth(inst_idx)
+
+        # Get instance name for logging
+        instance_name_elem = header.locator("div.l-col strong")
+        instance_name = "Unknown"
+        if await instance_name_elem.count() > 0:
+            instance_name = (await instance_name_elem.text_content()).strip()
+
+        # Get instance ID
+        instance_id = await header.get_attribute("data-id") or f"inst_{inst_idx}"
+
+        log.info(f"\n  [{inst_idx + 1}/{instance_count}] {instance_name} (ID: {instance_id[:8]}...)")
+
+        # Collect PDFs from header itself (main decision PDF)
+        header_pdfs = header.locator("a[href*='PdfDocument']")
+        header_pdf_count = await header_pdfs.count()
+        for i in range(header_pdf_count):
+            url = await header_pdfs.nth(i).get_attribute("href")
+            if url:
+                all_urls.add(url)
+
+        if header_pdf_count > 0:
+            log.info(f"    Header PDFs: {header_pdf_count}")
+
+        # Find the collapse button to expand this instance
+        collapse_btn = header.locator(".b-collapse.js-collapse")
+        if await collapse_btn.count() == 0:
+            log.info(f"    No expand button, skipping details")
             continue
 
-        # Extract filename from URL
-        filename = pdf_url.split("/")[-1]
-        filepath = case_dir / filename
+        # Check if already expanded
+        container = page.locator(f".b-chrono-items-container.js-chrono-items-container").nth(inst_idx)
+        is_visible = False
+        try:
+            style = await container.get_attribute("style") or ""
+            is_visible = "display: none" not in style and await container.is_visible()
+        except:
+            pass
 
-        # Skip if already downloaded
-        if filepath.exists():
-            log.info(f"⏭️  Already exists: {filename}")
-            downloaded.append(str(filepath))
+        if not is_visible:
+            # Click to expand
+            await collapse_btn.click()
+            await page.wait_for_timeout(1000)
+
+        # Now find pagination for this instance (if any)
+        # The container follows the header
+        instance_container = page.locator(f".b-chrono-items-container.js-chrono-items-container").nth(inst_idx)
+
+        # Check if container is now visible
+        try:
+            await instance_container.wait_for(state="visible", timeout=3000)
+        except:
+            log.info(f"    Container not visible, skipping")
             continue
 
-        log.info(f"⬇️  Downloading: {filename[:60]}...")
+        # Get pagination info for this instance
+        pagination_items = instance_container.locator(".js-chrono-pagination-pager-item[data-page_num]")
+        pagination_count = await pagination_items.count()
 
+        max_page = 1
+        if pagination_count > 0:
+            for i in range(pagination_count):
+                page_num_str = await pagination_items.nth(i).get_attribute("data-page_num")
+                if page_num_str:
+                    try:
+                        max_page = max(max_page, int(page_num_str))
+                    except ValueError:
+                        pass
+
+        log.info(f"    Pages: {max_page}")
+
+        # Parse all pages for this instance
+        for page_num in range(1, max_page + 1):
+            if page_num > 1:
+                # Navigate to this page
+                page_btn = instance_container.locator(f".js-chrono-pagination-pager-item[data-page_num='{page_num}']")
+                if await page_btn.count() > 0:
+                    await page_btn.click()
+                    await page.wait_for_timeout(1500)
+
+            # Collect PDFs from current page
+            page_pdfs = instance_container.locator("a[href*='PdfDocument']")
+            pdf_count = await page_pdfs.count()
+
+            for i in range(pdf_count):
+                url = await page_pdfs.nth(i).get_attribute("href")
+                if url:
+                    all_urls.add(url)
+
+            if max_page > 1:
+                log.info(f"      Page {page_num}/{max_page}: {pdf_count} PDF(s)")
+
+        # Collapse back to clean up UI (optional, but good practice)
+        # await collapse_btn.click()
+        # await page.wait_for_timeout(300)
+
+    log.info(f"\n📋 Total unique PDFs from Cards: {len(all_urls)}")
+    return all_urls
+
+
+async def click_ed_tab(page: Page) -> bool:
+    """
+    Click on "Электронное дело" tab.
+    Returns True if successful.
+    """
+    log.info("Clicking on 'Электронное дело' tab...")
+
+    # Find and click the tab
+    ed_tab = page.locator("div.js-case-chrono-button--ed")
+
+    if await ed_tab.count() == 0:
+        log.warning("'Электронное дело' tab not found")
+        return False
+
+    await ed_tab.click()
+
+    # Wait for content to become visible
+    try:
+        await page.wait_for_selector(
+            "#chrono_ed_content:not(.g-hidden)",
+            timeout=10000
+        )
+        log.info("'Электронное дело' tab opened")
+        await page.wait_for_timeout(500)
+        return True
+    except Exception as e:
+        log.error(f"Failed to open 'Электронное дело' tab: {e}")
+        return False
+
+
+async def get_ed_total_pages(page: Page) -> int:
+    """
+    Get total number of pages in "Электронное дело" pagination.
+    Returns number of pages (minimum 1).
+    """
+    # Find pagination items inside ED content
+    pagination_items = page.locator(
+        "#chrono_ed_content .js-chrono-pagination-pager-item[data-page_num]"
+    )
+    count = await pagination_items.count()
+
+    if count == 0:
+        return 1
+
+    # Find max page number
+    max_page = 1
+    for i in range(count):
+        page_num_str = await pagination_items.nth(i).get_attribute("data-page_num")
+        if page_num_str:
+            try:
+                page_num = int(page_num_str)
+                max_page = max(max_page, page_num)
+            except ValueError:
+                pass
+
+    log.info(f"📖 ED pagination: {max_page} page(s)")
+    return max_page
+
+
+async def parse_ed_page_documents(page: Page) -> set[str]:
+    """
+    Parse PDF URLs from current "Электронное дело" page.
+    Returns set of URLs.
+    """
+    pdf_urls = set()
+
+    # ED document links
+    ed_links = page.locator("#chrono_ed_content a.b-case-chrono-ed-item-link[href*='PdfDocument']")
+    count = await ed_links.count()
+
+    for i in range(count):
+        url = await ed_links.nth(i).get_attribute("href")
+        if url:
+            pdf_urls.add(url)
+
+    return pdf_urls
+
+
+async def navigate_ed_page(page: Page, page_num: int) -> bool:
+    """
+    Navigate to specific page in "Электронное дело" pagination.
+    Returns True if successful.
+    """
+    log.info(f"  Navigating to ED page {page_num}...")
+
+    # Find pagination item with specific page number inside ED content
+    page_item = page.locator(
+        f"#chrono_ed_content .js-chrono-pagination-pager-item[data-page_num='{page_num}']"
+    )
+
+    if await page_item.count() == 0:
+        log.warning(f"  Page {page_num} not found in pagination")
+        return False
+
+    # Click on page number
+    await page_item.click()
+
+    # Wait for content to update (AJAX)
+    await page.wait_for_timeout(1500)
+
+    # Verify we're on the right page (active class)
+    active_item = page.locator(
+        "#chrono_ed_content .js-chrono-pagination-pager-item--active"
+    )
+    if await active_item.count() > 0:
+        active_page = await active_item.get_attribute("data-page_num")
+        if active_page == str(page_num):
+            return True
+
+    # Even if verification fails, content might have loaded
+    return True
+
+
+async def collect_ed_all_pages(page: Page) -> set[str]:
+    """
+    Collect all PDF URLs from all pages of "Электронное дело".
+    Returns deduplicated set of URLs.
+    """
+    all_urls = set()
+
+    # Click on ED tab first
+    if not await click_ed_tab(page):
+        return all_urls
+
+    # Get total pages
+    total_pages = await get_ed_total_pages(page)
+
+    # Parse all pages
+    for page_num in range(1, total_pages + 1):
+        if page_num > 1:
+            if not await navigate_ed_page(page, page_num):
+                log.warning(f"  Failed to navigate to page {page_num}, continuing...")
+                continue
+
+        # Parse current page
+        page_urls = await parse_ed_page_documents(page)
+        log.info(f"  Page {page_num}/{total_pages}: found {len(page_urls)} PDF(s)")
+        all_urls.update(page_urls)
+
+    log.info(f"📋 Total unique PDFs from ED: {len(all_urls)}")
+    return all_urls
+
+
+async def download_single_pdf(
+        page: Page,
+        pdf_url: str,
+        filepath: Path,
+        idx: int,
+        total: int,
+        max_retries: int = 3
+) -> bool:
+    """
+    Download single PDF with retry logic.
+    Returns True if successful.
+    """
+    filename = filepath.name
+
+    for attempt in range(1, max_retries + 1):
+        pdf_page = None
         try:
             # Open new tab
             pdf_page = await page.context.new_page()
@@ -367,270 +523,235 @@ async def download_case_pdfs(page: Page, case_details: dict, download_dir: str =
             # Set up response interceptor BEFORE navigating
             async def handle_response(response):
                 nonlocal pdf_content
-                # Look for PDF response
                 if "Pdf" in response.url:
                     content_type = response.headers.get("content-type", "")
-                    log.info(f"   📡 PDF-related response: {response.status} {content_type[:30]} {response.url[:80]}")
                     if response.status == 200 and "application/pdf" in content_type:
                         try:
                             pdf_content = await response.body()
-                            log.info(f"   📦 Intercepted PDF ({len(pdf_content)} bytes)")
                         except Exception as e:
-                            log.warning(f"   Failed to get body: {e}")
+                            log.debug(f"  Failed to get body: {e}")
 
             pdf_page.on("response", handle_response)
 
-            # Navigate - use domcontentloaded, not load (load may never fire for PDF)
-            await pdf_page.goto(pdf_url, wait_until="domcontentloaded", timeout=30000)
+            # Navigate with longer timeout
+            await pdf_page.goto(pdf_url, wait_until="domcontentloaded", timeout=60000)
 
-            # Wait for WASM antibot check to complete
+            # Wait for WASM antibot check
             await pdf_page.wait_for_timeout(2000)
 
-            # Check if we're on an antibot page
+            # Check for antibot page
             salto_div = pdf_page.locator("#salto")
             if await salto_div.count() > 0 and not pdf_content:
-                log.info("   🔐 WASM antibot detected, waiting for completion...")
-
-                # Wait for the antibot form to disappear (WASM submits it automatically)
+                log.debug("  WASM antibot detected, waiting...")
                 try:
                     await pdf_page.locator("#searchForm").wait_for(state="detached", timeout=30000)
-                    log.info("   ✅ Antibot form submitted")
-                except Exception as e:
-                    log.warning(f"   Form didn't disappear: {e}")
+                except:
+                    pass
+                await pdf_page.wait_for_timeout(3000)
 
-                # Give time for PDF to load after form submission
-                await pdf_page.wait_for_timeout(5000)
-
-            # Check if we got PDF via interceptor
+            # Save PDF if intercepted
             if pdf_content and pdf_content[:4] == b'%PDF':
                 filepath.write_bytes(pdf_content)
                 file_size = len(pdf_content) / 1024
-                log.info(f"✅ Saved (intercepted): {filename} ({file_size:.1f} KB)")
-                downloaded.append(str(filepath))
+                log.info(f"[{idx}/{total}] ✅ Saved: {filename[:50]}... ({file_size:.1f} KB)")
+                await pdf_page.close()
+                return True
             else:
-                # Try to check if browser is displaying PDF
-                current_url = pdf_page.url
-                log.info(f"   Current URL: {current_url}")
-
-                # Check if there's an embed/object with PDF
-                embed = pdf_page.locator("embed, object, iframe").first
-                if await embed.count() > 0:
-                    embed_src = await embed.get_attribute("src") or await embed.get_attribute("data")
-                    if embed_src:
-                        log.info(f"   Found embed: {embed_src[:50]}...")
-
-                # Take screenshot for debugging
-                screenshot_path = case_dir / f"debug_{filename}.png"
-                await pdf_page.screenshot(path=str(screenshot_path))
-                log.info(f"   📸 Debug screenshot: {screenshot_path.name}")
-
-                # Save HTML for analysis
-                html_path = case_dir / f"debug_{filename}.html"
-                html_path.write_text(await pdf_page.content())
-                log.warning(f"⚠️  Could not get PDF, saved debug files")
-
-            await pdf_page.close()
+                log.warning(f"[{idx}/{total}] ⚠️  No PDF content (attempt {attempt}/{max_retries})")
 
         except Exception as e:
-            log.error(f"❌ Failed to download {filename}: {e}")
+            log.warning(f"[{idx}/{total}] ⚠️  Attempt {attempt}/{max_retries} failed: {type(e).__name__}")
 
-    log.info(f"📥 Downloaded {len(downloaded)} of {len(instances)} PDFs")
-    return downloaded
+        finally:
+            if pdf_page:
+                try:
+                    await pdf_page.close()
+                except:
+                    pass
+
+        # Retry delay with exponential backoff
+        if attempt < max_retries:
+            delay = 2 ** attempt  # 2, 4, 8 seconds
+            log.info(f"[{idx}/{total}] 🔄 Retrying in {delay}s...")
+            await asyncio.sleep(delay)
+
+    log.error(f"[{idx}/{total}] ❌ Failed after {max_retries} attempts: {filename[:50]}...")
+    return False
 
 
-async def extract_search_results(page: Page) -> list[dict]:
+async def download_pdf_batch(
+        page: Page,
+        pdf_urls: set[str],
+        case_dir: Path,
+        delay_between: float = 0.5
+) -> list[str]:
     """
-    Extract case information from search results.
-
-    Returns list of cases with their metadata.
+    Download all PDFs from URL set.
+    Uses response interceptor to capture PDF content.
+    Returns list of downloaded file paths.
     """
-    results = []
+    downloaded = []
+    failed = []
+    total = len(pdf_urls)
 
-    # Check if we have results
-    rows = page.locator("table#b-cases tbody tr")
-    count = await rows.count()
+    for idx, pdf_url in enumerate(pdf_urls, 1):
+        # Extract filename from URL
+        filename = pdf_url.split("/")[-1]
+        filepath = case_dir / filename
 
-    if count == 0:
-        log.warning("No results found")
-        return results
-
-    log.info(f"Found {count} result(s)")
-
-    for i in range(count):
-        row = rows.nth(i)
-
-        try:
-            # Extract case number and link
-            case_link = row.locator("td.num a.num_case")
-            case_number = (await case_link.text_content()).strip()
-            case_url = await case_link.get_attribute("href")
-
-            # Extract date (from the span inside civil/administrative div)
-            date_elem = row.locator("td.num span").first
-            case_date = (await date_elem.text_content()).strip() if await date_elem.count() > 0 else ""
-
-            # Extract judge (div.judge with title)
-            judge_elem = row.locator("td.court div.judge")
-            judge = (await judge_elem.get_attribute("title")) if await judge_elem.count() > 0 else ""
-
-            # Extract court (div with title but NOT .judge)
-            court_elem = row.locator("td.court div[title]:not(.judge)")
-            court = (await court_elem.get_attribute("title")) if await court_elem.count() > 0 else ""
-
-            # Extract plaintiff - get direct text, not nested spans
-            plaintiff_elem = row.locator("td.plaintiff div.b-container > div > span.js-rollover").first
-            if await plaintiff_elem.count() > 0:
-                # Get only the direct text content (before hidden span)
-                plaintiff = await page.evaluate(
-                    "(el) => el.childNodes[0]?.textContent?.trim() || ''",
-                    await plaintiff_elem.element_handle()
-                )
-            else:
-                plaintiff = ""
-
-            # Extract defendant - same approach
-            defendant_elem = row.locator("td.respondent div.b-container > div > span.js-rollover").first
-            if await defendant_elem.count() > 0:
-                defendant = await page.evaluate(
-                    "(el) => el.childNodes[0]?.textContent?.trim() || ''",
-                    await defendant_elem.element_handle()
-                )
-            else:
-                defendant = ""
-
-            case_info = {
-                "case_number": case_number,
-                "url": case_url,
-                "date": case_date,
-                "court": court,
-                "judge": judge,
-                "plaintiff": plaintiff,
-                "defendant": defendant,
-            }
-            results.append(case_info)
-
-            log.info(f"  [{i + 1}] {case_number} | {court} | {plaintiff[:30]}... vs {defendant[:30]}...")
-
-        except Exception as e:
-            log.error(f"Error extracting row {i}: {e}")
+        # Skip if already downloaded
+        if filepath.exists():
+            log.info(f"[{idx}/{total}] ⏭️  Already exists: {filename[:50]}...")
+            downloaded.append(str(filepath))
             continue
 
-    return results
+        log.info(f"[{idx}/{total}] ⬇️  Downloading: {filename[:50]}...")
+
+        success = await download_single_pdf(page, pdf_url, filepath, idx, total)
+
+        if success:
+            downloaded.append(str(filepath))
+        else:
+            failed.append(pdf_url)
+
+        # Small delay between downloads to avoid rate limiting
+        if idx < total:
+            await asyncio.sleep(delay_between)
+
+    if failed:
+        log.warning(f"\n⚠️  Failed downloads ({len(failed)}):")
+        for url in failed[:10]:  # Show first 10
+            log.warning(f"   - {url.split('/')[-1]}")
+        if len(failed) > 10:
+            log.warning(f"   ... and {len(failed) - 10} more")
+
+    return downloaded
 
 
 async def main():
     """Main entry point."""
-
-    # Test case numbers
+    # Test case - big bankruptcy case with 9 pages in ED
     test_cases = [
-        "А40-57726/2024",  # Complex: 2 instances
-        # "А40-185772/2022",  # Simple: 1 instance
+        "А60-21280/2023",
     ]
 
     async with async_playwright() as p:
-        # Launch browser with anti-detection arguments
-        log.info("Launching browser...")
-        # Try Firefox instead of Chromium (different fingerprint)
+        log.info("Launching Firefox browser...")
         browser: Browser = await p.firefox.launch(
             headless=HEADLESS,
             slow_mo=SLOW_MO,
         )
 
-        # Create context with downloads enabled
         context = await browser.new_context(
             viewport={"width": 1920, "height": 1080},
             locale="ru-RU",
             timezone_id="Europe/Moscow",
-            accept_downloads=True,  # Enable file downloads
+            accept_downloads=True,
         )
 
         page = await context.new_page()
 
-        # Apply stealth mode to avoid bot detection
+        # Apply stealth mode
         if HAS_STEALTH:
             await stealth_async(page)
             log.info("Stealth mode applied")
         else:
-            log.warning("Stealth mode not available - applying basic patches...")
-            # Basic stealth patches (Firefox-compatible)
             await page.add_init_script("""
-                // Overwrite the 'webdriver' property
                 Object.defineProperty(navigator, 'webdriver', {
                     get: () => undefined
                 });
             """)
 
-        # Log network requests for debugging
-        async def log_request(request):
-            # Log all POST requests and any request to arbitr.ru
-            if request.method == "POST" or "arbitr.ru" in request.url:
-                log.info(f"🌐 Request: {request.method} {request.url[:100]}")
-
-        async def log_response(response):
-            if response.request.method == "POST" or "Kad" in response.url:
-                log.info(f"📥 Response: {response.status} {response.url[:100]}")
-
-        page.on("request", log_request)
-        page.on("response", log_response)
-
-        # Log browser console messages
-        page.on("console", lambda msg: log.info(f"🖥️ Console: {msg.text}") if msg.type != "warning" else None)
-        page.on("pageerror", lambda err: log.error(f"❌ Page error: {err}"))
-
         try:
-            # Navigate to the main page
+            # Navigate to main page
             log.info(f"Navigating to {BASE_URL}")
             await page.goto(BASE_URL, wait_until="domcontentloaded", timeout=60000)
-            log.info("Page loaded (DOM ready)")
+            log.info("Page loaded")
 
-            # Test search
             for case_number in test_cases:
-                log.info(f"\n{'=' * 50}")
-                log.info(f"Testing case: {case_number}")
-                log.info('=' * 50)
+                log.info(f"\n{'=' * 60}")
+                log.info(f"Processing case: {case_number}")
+                log.info('=' * 60)
 
+                # Search for case
                 success = await search_by_case_number(page, case_number)
+                if not success:
+                    log.error("Search failed, skipping case")
+                    continue
 
-                if success:
-                    results = await extract_search_results(page)
-                    log.info(f"Extracted {len(results)} case(s)")
+                # Check if we're on case card or search results
+                case_id_input = page.locator("input#caseId")
+                if await case_id_input.count() > 0:
+                    # Already on case card
+                    case_guid = await case_id_input.get_attribute("value")
+                    case_url = f"https://kad.arbitr.ru/Card/{case_guid}"
+                else:
+                    # Need to navigate from search results
+                    case_link = page.locator("table#b-cases tbody tr td.num a.num_case").first
+                    if await case_link.count() > 0:
+                        case_url = await case_link.get_attribute("href")
+                    else:
+                        log.error("Could not find case link")
+                        continue
 
-                    for r in results:
-                        log.info(f"\nCase details:")
-                        for k, v in r.items():
-                            log.info(f"  {k}: {v}")
+                # Navigate to case card
+                case_details = await navigate_to_case_card(page, case_url)
+                if not case_details:
+                    log.error("Failed to load case card")
+                    continue
 
-                        # Navigate to case card if URL available
-                        if r.get("url"):
-                            case_details = await navigate_to_case_card(page, r["url"])
-                            if case_details:
-                                log.info(f"\n=== Case Card Details ===")
-                                log.info(f"  GUID: {case_details.get('guid')}")
-                                log.info(f"  Status: {case_details.get('status')}")
-                                log.info(f"  Instances: {len(case_details.get('instances', []))}")
+                log.info(f"\n--- Collecting PDF URLs ---")
 
-                                for inst in case_details.get("instances", []):
-                                    log.info(f"\n  --- Instance ---")
-                                    for k, v in inst.items():
-                                        log.info(f"    {k}: {v}")
+                # 1. Collect PDFs from Court Acts (no pagination)
+                court_acts_pdfs = await collect_court_acts_pdf_urls(page)
 
-                                # Download PDFs
-                                if case_details.get("instances"):
-                                    downloaded = await download_case_pdfs(page, case_details)
-                                    log.info(f"\n📦 Total downloaded: {len(downloaded)} files")
+                # 2. Collect PDFs from "Карточки" (with pagination)
+                cards_pdfs = await collect_cards_all_pages(page)
 
-                # Reset for next search (reload page)
-                if len(test_cases) > 1:
-                    await page.goto(BASE_URL, wait_until="networkidle")
+                # 3. Collect PDFs from "Электронное дело" (with pagination)
+                ed_pdfs = await collect_ed_all_pages(page)
 
-            # Keep browser open for inspection
-            log.info("\n" + "=" * 50)
-            log.info("Done! Browser will close in 5 seconds...")
-            log.info("=" * 50)
+                # Merge and deduplicate
+                all_pdfs = court_acts_pdfs | cards_pdfs | ed_pdfs
+                log.info(f"\n📊 TOTAL UNIQUE PDFs: {len(all_pdfs)}")
+                log.info(f"   - From Court Acts: {len(court_acts_pdfs)}")
+                log.info(f"   - From Cards: {len(cards_pdfs)}")
+                log.info(f"   - From ED: {len(ed_pdfs)}")
+
+                # Calculate overlaps
+                acts_cards_overlap = len(court_acts_pdfs & cards_pdfs)
+                acts_ed_overlap = len(court_acts_pdfs & ed_pdfs)
+                cards_ed_overlap = len(cards_pdfs & ed_pdfs)
+                log.info(
+                    f"   - Overlaps: Acts∩Cards={acts_cards_overlap}, Acts∩ED={acts_ed_overlap}, Cards∩ED={cards_ed_overlap}")
+
+                # Create download folder
+                safe_case_number = case_details.get("case_number", "unknown").replace("/", "-")
+                case_dir = Path("./downloads") / safe_case_number
+                case_dir.mkdir(parents=True, exist_ok=True)
+                log.info(f"\n📁 Download folder: {case_dir}")
+
+                # Download all PDFs
+                log.info(f"\n--- Downloading {len(all_pdfs)} PDF(s) ---")
+                downloaded = await download_pdf_batch(page, all_pdfs, case_dir)
+
+                # Summary
+                log.info(f"\n{'=' * 60}")
+                log.info(f"📦 DOWNLOAD COMPLETE")
+                log.info(f"   Total PDFs found: {len(all_pdfs)}")
+                log.info(f"   Successfully downloaded: {len(downloaded)}")
+                log.info(f"   Failed: {len(all_pdfs) - len(downloaded)}")
+                log.info(f"   Location: {case_dir.absolute()}")
+                log.info('=' * 60)
+
+            # Done
+            log.info("\nBrowser will close in 5 seconds...")
             await asyncio.sleep(5)
 
         except Exception as e:
             log.error(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
             raise
         finally:
             await browser.close()
