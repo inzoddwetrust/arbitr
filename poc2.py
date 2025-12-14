@@ -1350,18 +1350,10 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
         fingerprint_match = await check_fingerprint_quick(page, cached_case_info.fingerprints)
 
         if fingerprint_match:
-            log.info("📋 Using cached structure (no changes detected)")
-            use_cache = True
-
-            # Load cached structure
-            instances = load_cached_instances(output_dir)
-            all_docs = load_cached_documents_metadata(output_dir, instances)
-
-            # Use cached case_info but update parsed_at
-            case_info = cached_case_info
-            case_info.url = case_url  # Make sure URL is set for refresh
-
-            log.info(f"   Loaded {len(instances)} instances, {len(all_docs)} document metadata")
+            log.info("📋 Fingerprint match — structure unchanged, but will parse for full doc list")
+            # NOTE: use_cache disabled because load_cached_documents_metadata
+            # only reads downloaded files, not the full list
+            # TODO: fix cache to store full document list separately
         else:
             log.info("📋 Structure changed, re-parsing...")
 
@@ -1425,6 +1417,7 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
     downloaded_count = len(progress.downloaded)
     failed_count = 0
     rate_limited = False
+    consecutive_failures = 0  # Track failures in a row
 
     for idx, doc in enumerate(docs_to_download, 1):
         # Check for break
@@ -1441,6 +1434,7 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
                 await page.wait_for_timeout(5000)
             except Exception as e:
                 log.warning(f"Session refresh failed: {e}")
+            consecutive_failures = 0  # Reset after refresh
 
         # Download PDF
         log.info(f"\n[{downloaded_count + idx}/{total_docs}] ⬇️  {doc.filename[:50]}...")
@@ -1462,7 +1456,25 @@ async def process_case(page: Page, case_number: str, output_base: Path) -> bool:
             if doc.doc_id in progress.pending:
                 progress.pending.remove(doc.doc_id)
             failed_count += 1
+            consecutive_failures += 1
+
+            # 3 failures in a row — session is stale, force refresh
+            if consecutive_failures >= 3:
+                log.warning("⚠️ 3 failures in a row — forcing session refresh...")
+                await take_break()
+                try:
+                    log.info("🔄 Refreshing session (1/2)...")
+                    await page.goto(case_info.url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+
+                    log.info("🔄 Refreshing session (2/2)...")
+                    await page.goto(case_info.url, wait_until="domcontentloaded", timeout=30000)
+                    await page.wait_for_timeout(5000)
+                except Exception as e:
+                    log.warning(f"Session refresh failed: {e}")
+                consecutive_failures = 0
         else:
+            consecutive_failures = 0  # Success — reset counter
             # Extract text
             text, requires_ocr = extract_text_from_pdf(pdf_bytes)
 
